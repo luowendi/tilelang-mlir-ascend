@@ -650,11 +650,12 @@ def npuir_store_fixpipe(
         tir.Call: A handle to the npuir_store_fixpipe operation
     """
 
+    src_dtype = src.buffer.dtype if isinstance(src, (BufferRegion, BufferLoad)) else src.dtype
+    dst_dtype = dst.buffer.dtype if isinstance(dst, (BufferRegion, BufferLoad)) else dst.dtype
     assert (
-        (src.dtype == dst.dtype)
-        or (src.dtype == "float32" and dst.dtype == "float16")
-        or (src.dtype == "float32" and dst.dtype == "bfloat16")
-        or (src.dtype == "int32" and dst.dtype == "int8")
+        (src_dtype == dst_dtype)
+        or (src_dtype == "float32" and dst_dtype in ("float16", "bfloat16"))
+        or (src_dtype == "int32" and dst_dtype == "int8")
     ), "Unexpected pre-quant mode in npuir_store_fixpipe"
 
     src = _to_region(src, "r", _get_extent(src) if size is None else size)
@@ -678,7 +679,11 @@ def npuir_brc(src, dst):
         src (Union[tir.Buffer, tir.BufferLoad, tir.BufferRegion, tir.PrimExpr]): Source vector or scalar
         dst (Union[tir.Buffer, tir.BufferLoad]): Destination vector
     """
-    src_extent = _get_extent(src)
+    # A fully indexed load is a scalar, not a rank-preserving tensor slice.
+    scalar_load = isinstance(src, tir.BufferLoad) and all(
+        not isinstance(index, tir.Ramp) for index in src.indices
+    )
+    src_extent = [] if scalar_load else _get_extent(src)
     dst_extent = _get_extent(dst)
 
     if not isinstance(src, tir.PrimExpr):

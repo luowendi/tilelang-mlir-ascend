@@ -9,6 +9,7 @@
 #include "../op/ascend.h"
 #include "../op/builtin.h"
 #include "arith/pattern_match.h"
+#include "npuir_fixpipe_compat.h"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -1411,9 +1412,9 @@ void CodeGenTileLangNPUIRAPI::AscendCopyCodegen(const CallNode *op) {
         mlir::hivm::FixpipePreReluModeAttr::get(builder.getContext(),
                                                 pre_relu_mode);
     mlir::BoolAttr channel_split = builder.getBoolAttr(false);
-    builder.create<mlir::hivm::FixpipeOp>(
-        builder.getUnknownLoc(), mlir::TypeRange{}, src, dst, enable_nz2nd,
-        pre_quant, pre_relu, channel_split);
+    CreateFixpipeCompat(builder, builder.getUnknownLoc(), mlir::TypeRange{},
+                        src, dst, enable_nz2nd, pre_quant, pre_relu,
+                        channel_split);
     return;
   }
 
@@ -1793,9 +1794,9 @@ void CodeGenTileLangNPUIRAPI::Nd2NzCodegen(const CallNode *op) {
   // nd2nz calls in the same function, preventing callee signature mismatches.
   mlir::Value src = GenRankReducedSubviewFromRegion(
       npuirop.src, npuirop.src_range, /*min_rank=*/2);
-  // dst is cbuf: downstream will cast to 4D, so no min_rank needed.
-  mlir::Value dst =
-      GenRankReducedSubviewFromRegion(npuirop.dst, npuirop.dst_range);
+  // Preserve explicit physical NZ rank, including M1=1 tails.
+  mlir::Value dst = GenRankReducedSubviewFromRegion(
+      npuirop.dst, npuirop.dst_range, npuirop.dst_range.size() >= 4 ? 4 : 2);
 
   // gen hivm.hir.nd2nz
   mlir::Location unknown_loc = builder.getUnknownLoc();
@@ -1822,9 +1823,9 @@ void CodeGenTileLangNPUIRAPI::FixpipeCodegen(const CallNode *op) {
   // Generate hivm.hir.fixpipe for tl.npuir_store_fixpipe.
   tvm::tl::NpuirFixpipe npuirop(op->args, this->vmap);
   // gen memref.subview
-  // src is cc: no min_rank needed.
-  mlir::Value src =
-      GenRankReducedSubviewFromRegion(npuirop.src, npuirop.src_range);
+  // Preserve explicit physical NZ L0C rank, including M1/N1=1.
+  mlir::Value src = GenRankReducedSubviewFromRegion(
+      npuirop.src, npuirop.src_range, npuirop.src_range.size() >= 4 ? 4 : 2);
   // dst is GM: ensure min_rank=2 to maintain consistent GM rank across all
   // fixpipe calls in the same function, preventing callee signature mismatches.
   mlir::Value dst = GenRankReducedSubviewFromRegion(
@@ -1861,9 +1862,8 @@ void CodeGenTileLangNPUIRAPI::FixpipeCodegen(const CallNode *op) {
       mlir::hivm::FixpipePreReluModeAttr::get(builder.getContext(),
                                               pre_relu_mode);
   mlir::BoolAttr channel_split = builder.getBoolAttr(npuirop.channel_split);
-  builder.create<mlir::hivm::FixpipeOp>(unknown_loc, result, src, dst,
-                                        enable_nz2nd, pre_quant, pre_relu,
-                                        channel_split);
+  CreateFixpipeCompat(builder, unknown_loc, result, src, dst, enable_nz2nd,
+                      pre_quant, pre_relu, channel_split);
 }
 
 void CodeGenTileLangNPUIRAPI::DotCodegen(const CallNode *op) {
@@ -1894,21 +1894,10 @@ void CodeGenTileLangNPUIRAPI::DotCodegen(const CallNode *op) {
   mlir::Location unknown_loc = builder.getUnknownLoc();
   mlir::IndexType idx_ty = builder.getIndexType();
   mlir::Value a, b, c;
-  if (npuirop.src0_range.size() > 2) {
-    a = GenRankReducedSubviewFromRegion(npuirop.src0, npuirop.src0_range, 2);
-  } else {
-    a = GetVarValue(npuirop.src0->data.get());
-  }
-  if (npuirop.src1_range.size() > 2) {
-    b = GenRankReducedSubviewFromRegion(npuirop.src1, npuirop.src1_range, 2);
-  } else {
-    b = GetVarValue(npuirop.src1->data.get());
-  }
-  if (npuirop.dst_range.size() > 2) {
-    c = GenRankReducedSubviewFromRegion(npuirop.dst, npuirop.dst_range, 2);
-  } else {
-    c = GetVarValue(npuirop.dst->data.get());
-  }
+  // Respect rank-two slice offsets when consuming a large L1 tile in K chunks.
+  a = GenRankReducedSubviewFromRegion(npuirop.src0, npuirop.src0_range, 2);
+  b = GenRankReducedSubviewFromRegion(npuirop.src1, npuirop.src1_range, 2);
+  c = GenRankReducedSubviewFromRegion(npuirop.dst, npuirop.dst_range, 2);
   mlir::TypeRange result_tensors = {};
   mlir::Value init_condition = MakeValue(npuirop.initC);
 
@@ -2001,6 +1990,12 @@ void CodeGenTileLangNPUIRAPI::CreateHIVMBinaryVectorOp(const CallNode *op) {
     enableScalerSrc0 = false;
   }
   bool enableScalerSrc1 = binaryOp.Src0().IsTensor();
+  // Keep tensor denominators on the vector pipeline for R23 RMS division.
+  // Scalarizing a 1x1 UB denominator introduces an unpaired V-to-S load and
+  // changes vector division into a scalar reciprocal path.
+  if constexpr (std::is_same<T, mlir::hivm::VDivOp>::value) {
+    enableScalerSrc1 = false;
+  }
   if constexpr (T::template hasTrait<OpTrait::VectorOnlyTrait<1>::Impl>()) {
     ICHECK(binaryOp.Src1().IsTensor())
         << "The second operand of \"" << T::getOperationName().str()
@@ -2233,8 +2228,7 @@ void CodeGenTileLangNPUIRAPI::ReshapeCodegen(const CallNode *op) {
   auto dstMemRefTy =
       mlir::MemRefType::get(dstShapeForType, elemTy, layoutAttr, memSpace);
 
-  SmallVector<mlir::OpFoldResult> offsets(dstShape.size(),
-                                          builder.getIndexAttr(0));
+  SmallVector<mlir::OpFoldResult> offsets{builder.getIndexAttr(0)};
   SmallVector<mlir::OpFoldResult> sizes =
       BuildIndexFoldResultsFromExprs(builder, dstShape, toIndexValue);
   SmallVector<mlir::OpFoldResult> strides =
@@ -2247,7 +2241,167 @@ void CodeGenTileLangNPUIRAPI::ReshapeCodegen(const CallNode *op) {
 }
 
 void CodeGenTileLangNPUIRAPI::CallExternCodegen(const CallNode *op) {
-  // Todo: Implementation pending
+  // Narrow packed-NZ intrinsics; T.copy(GM, L1) retains ND2NZ semantics.
+  const auto *name = op->args[0].as<StringImmNode>();
+  ICHECK(name) << "call_extern requires a constant name";
+  if (name->value == "r23_load_nz") {
+    ICHECK_EQ(op->args.size(), 3);
+    Array<PrimExpr> args{op->args[1], op->args[2], Integer(1)};
+    tvm::tl::NpuirNd2nz load(args, this->vmap);
+    auto src = GenRankReducedSubviewFromRegion(load.src, load.src_range, 4);
+    auto dst = GenRankReducedSubviewFromRegion(load.dst, load.dst_range, 4);
+    // Treat the physical NZ tile as strided rows of 16-bit payload. The
+    // bitcast is byte preserving and avoids inference treating GM as ND and
+    // inserting an erroneous second ND2NZ conversion.
+    auto loc = builder.getUnknownLoc();
+    auto rawRows = [&](mlir::Value val) {
+      SmallVector<mlir::ReassociationIndices> groups{{0}, {1, 2, 3}};
+      auto rows =
+          builder.create<mlir::memref::CollapseShapeOp>(loc, val, groups);
+      auto ty = rows.getResult().getType().cast<mlir::MemRefType>();
+      auto rawTy = mlir::MemRefType::get(ty.getShape(), builder.getI16Type(),
+                                         ty.getLayout(), ty.getMemorySpace());
+      return builder.create<mlir::hivm::BitcastOp>(loc, rawTy, rows.getResult())
+          .getResult();
+    };
+    auto rawSrc = rawRows(src);
+    auto rawDst = rawRows(dst);
+    builder.create<mlir::hivm::LoadOp>(loc, mlir::TypeRange{}, rawSrc, rawDst);
+    return;
+  }
+  // Flash AscendC-compatible NZ schedule. Keep this route separate from
+  // r23: the sentinel delegates L0 ping-pong to the private backend while
+  // the caller owns all L1 synchronization.
+  if (name->value == "flash_gemm_nz" || name->value == "flash_store_nz") {
+    const bool isGemm = name->value == "flash_gemm_nz";
+    ICHECK_EQ(op->args.size(), isGemm ? 10 : 6);
+    auto loc = builder.getUnknownLoc();
+    auto i64Value = [&](PrimExpr expr) -> mlir::Value {
+      auto value = MakeValue(expr);
+      auto type = value.getType();
+      if (type.isIndex())
+        return builder.create<mlir::arith::IndexCastOp>(
+            loc, builder.getI64Type(), value);
+      auto integer = type.cast<mlir::IntegerType>();
+      if (integer.getWidth() < 64)
+        return builder.create<mlir::arith::ExtSIOp>(loc, builder.getI64Type(),
+                                                    value);
+      ICHECK_EQ(integer.getWidth(), 64);
+      return value;
+    };
+    auto constant = [&](int64_t value) -> mlir::Value {
+      return builder.create<mlir::arith::ConstantIntOp>(loc, value, 64);
+    };
+    SmallVector<mlir::Value> conditions;
+    SmallVector<mlir::Attribute> modes;
+    auto flag = op->args[isGemm ? 9 : 5];
+    auto mode = [&](int64_t value) -> mlir::Attribute {
+      return mlir::hivm::UnitFlagAttr::get(
+          builder.getContext(), static_cast<mlir::hivm::UNIT_FLAG>(value));
+    };
+    if (const auto *imm = flag.as<IntImmNode>()) {
+      ICHECK(imm->value == 0 || imm->value == 2 || imm->value == 3)
+          << "Flash unit flag must be 0, 2, or 3";
+      modes.push_back(mode(imm->value));
+    } else {
+      auto value = i64Value(flag);
+      for (int64_t choice : {2, 3}) {
+        conditions.push_back(builder.create<mlir::arith::CmpIOp>(
+            loc, mlir::arith::CmpIPredicate::eq, value, constant(choice)));
+        modes.push_back(mode(choice));
+      }
+    }
+    auto modeArray = builder.getArrayAttr(modes);
+    if (isGemm) {
+      Array<PrimExpr> args{op->args[1], op->args[2], op->args[3],
+                           op->args[4], Bool(false), Bool(false)};
+      tvm::tl::NpuirDot dot(args, this->vmap);
+      ICHECK(dot.src0->dtype == DataType::BFloat(16) &&
+             dot.src1->dtype == DataType::BFloat(16) &&
+             dot.dst->dtype == DataType::Float(32))
+          << "flash_gemm_nz requires BF16 operands and FP32 accumulator";
+      // A/B use physical NZ4 [K1,M1,16,16] / [N1,K1,16,16].
+      // Explicit padded M prevents the backend from changing Flash tile work.
+      ICHECK_EQ(dot.src0_range.size(), 4);
+      ICHECK_EQ(dot.src1_range.size(), 4);
+      ICHECK(analyzer_->CanProveEqual(
+          op->args[5], dot.src0_range[1]->extent * dot.src0_range[2]->extent))
+          << "flash_gemm_nz M must equal the padded physical A height";
+      ICHECK(analyzer_->CanProve(op->args[5] * op->args[6] * 2 <= 32768))
+          << "flash_gemm_nz A tile exceeds its 32 KiB L0 ping-pong slot";
+      ICHECK(analyzer_->CanProve(op->args[7] * op->args[6] * 2 <= 32768))
+          << "flash_gemm_nz B tile exceeds its 32 KiB L0 ping-pong slot";
+      auto a = GenRankReducedSubviewFromRegion(dot.src0, dot.src0_range, 4);
+      auto b = GenRankReducedSubviewFromRegion(dot.src1, dot.src1_range, 4);
+      auto c = GenRankReducedSubviewFromRegion(
+          dot.dst, dot.dst_range, dot.dst_range.size() >= 4 ? 4 : 2);
+      SmallVector<mlir::Value> sync{
+          constant(-20260918),   constant(-1), constant(-1), constant(-1),
+          i64Value(op->args[8]), constant(3),  constant(5)};
+      builder.create<mlir::hivm::MmadL1Op>(
+          loc, mlir::TypeRange{}, a, b, MakeValue(dot.initC),
+          CreateIndexCastOp(MakeValue(op->args[5])),
+          CreateIndexCastOp(MakeValue(op->args[6])),
+          CreateIndexCastOp(MakeValue(op->args[7])), c, sync, conditions,
+          mlir::Value{}, mlir::UnitAttr{}, mlir::UnitAttr{}, mlir::UnitAttr{},
+          modeArray);
+    } else {
+      Array<PrimExpr> args{op->args[1], op->args[2], Bool(true), Bool(false),
+                           Integer(0)};
+      tvm::tl::NpuirFixpipe store(args, this->vmap);
+      ICHECK_GE(store.dst_range.size(), 2);
+      auto dstRanges = store.dst_range;
+      const size_t rank = dstRanges.size();
+      dstRanges.Set(rank - 2, Range::FromMinExtent(dstRanges[rank - 2]->min,
+                                                   op->args[3]));
+      dstRanges.Set(rank - 1, Range::FromMinExtent(dstRanges[rank - 1]->min,
+                                                   op->args[4]));
+      auto src = GenRankReducedSubviewFromRegion(
+          store.src, store.src_range, store.src_range.size() >= 4 ? 4 : 2);
+      auto dst = GenRankReducedSubviewFromRegion(store.dst, dstRanges, 2);
+      auto quant = mlir::hivm::FixpipePreQuantMode::NO_QUANT;
+      if (store.src->dtype != store.dst->dtype) {
+        ICHECK(store.src->dtype == DataType::Float(32));
+        if (store.dst->dtype == DataType::BFloat(16))
+          quant = mlir::hivm::FixpipePreQuantMode::F322BF16;
+        else if (store.dst->dtype == DataType::Float(16))
+          quant = mlir::hivm::FixpipePreQuantMode::F322F16;
+        else
+          LOG(FATAL) << "Unsupported flash_store_nz conversion";
+      }
+      builder.create<mlir::hivm::FixpipeOp>(
+          loc, mlir::TypeRange{}, src, dst, conditions,
+          mlir::hivm::FixpipeDMAModeAttr::get(
+              builder.getContext(), mlir::hivm::FixpipeDMAMode::NZ2ND),
+          mlir::hivm::FixpipeDualDstModeAttr{},
+          mlir::hivm::FixpipePreQuantModeAttr::get(builder.getContext(), quant),
+          mlir::hivm::FixpipePreReluModeAttr::get(
+              builder.getContext(), mlir::hivm::FixpipePreReluMode::NO_RELU),
+          builder.getBoolAttr(false), modeArray);
+    }
+    return;
+  }
+  if (name->value == "r23_gemm_nz") {
+    ICHECK_EQ(op->args.size(), 10);
+    Array<PrimExpr> args{op->args[1], op->args[2], op->args[3],
+                         op->args[4], op->args[8], op->args[9]};
+    tvm::tl::NpuirDot dot(args, this->vmap);
+    auto a = GenRankReducedSubviewFromRegion(dot.src0, dot.src0_range, 4);
+    auto b = GenRankReducedSubviewFromRegion(dot.src1, dot.src1_range, 4);
+    auto c = GenRankReducedSubviewFromRegion(dot.dst, dot.dst_range,
+                                             dot.dst_range.size() >= 4 ? 4 : 2);
+    auto m = CreateIndexCastOp(MakeValue(op->args[5]));
+    auto k = CreateIndexCastOp(MakeValue(op->args[6]));
+    auto n = CreateIndexCastOp(MakeValue(op->args[7]));
+    builder.create<mlir::hivm::MmadL1Op>(
+        builder.getUnknownLoc(), mlir::TypeRange{}, a, b, MakeValue(dot.initC),
+        m, k, n, c, mlir::Value{},
+        dot.a_transpose ? builder.getUnitAttr() : mlir::UnitAttr(),
+        dot.b_transpose ? builder.getUnitAttr() : mlir::UnitAttr(),
+        mlir::UnitAttr());
+    return;
+  }
+  LOG(FATAL) << "Unsupported NPU-IR call_extern: " << name->value;
 }
 
 // Generate vector cosine approximation using polynomial expansion in codegen.
@@ -2596,7 +2750,24 @@ void CodeGenTileLangNPUIRAPI::VtanhCodegen(const CallNode *op) {
 }
 
 mlir::Value CodeGenTileLangNPUIRAPI::VisitExpr_(const CallNode *op) {
-  if (op->op.same_as(Op::Get("tl.npuir_pipe_barrier"))) {
+  if (op->op.same_as(builtin::if_then_else())) {
+    ICHECK_EQ(op->args.size(), 3);
+    auto loc = builder.getUnknownLoc();
+    auto condition = MakeValue(op->args[0]);
+    auto resultType = DTypetoMLIRType(op->dtype);
+    auto ifOp = builder.create<mlir::scf::IfOp>(
+        loc, mlir::TypeRange{resultType}, condition, true, true);
+    {
+      OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+      auto value = MakeValue(op->args[1]);
+      builder.create<mlir::scf::YieldOp>(loc, mlir::ValueRange{value});
+      builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
+      value = MakeValue(op->args[2]);
+      builder.create<mlir::scf::YieldOp>(loc, mlir::ValueRange{value});
+    }
+    return ifOp.getResult(0);
+  } else if (op->op.same_as(Op::Get("tl.npuir_pipe_barrier"))) {
     BarrierCodegen(op);
   } else if (op->op.same_as(builtin::call_extern())) {
     CallExternCodegen(op);
@@ -2713,7 +2884,8 @@ mlir::Value CodeGenTileLangNPUIRAPI::VisitExpr_(const CallNode *op) {
   } else if (op->op.same_as(Op::Get("tl.npuir_reshape"))) {
     ReshapeCodegen(op);
   } else {
-    VisitExpr_(op);
+    LOG(FATAL) << "Unsupported call in Expert NPUIR code generation: "
+               << op->op;
   }
   return mlir::Value();
 }
